@@ -1001,11 +1001,12 @@
         const SPEECH_RATE = 0.75;
         const WORDS_PER_MINUTE_BASE = 140;
         const MS_PER_WORD = (60000 / WORDS_PER_MINUTE_BASE) / SPEECH_RATE;
-        
+
         let playbackState = {
             isPlaying: false, currentParaId: null, currentLang: null, utterance: null,
             highlightInterval: null, currentWordIndex: 0, totalWords: 0, currentElement: null,
-            sectionMode: false, sectionElements: [], sectionElementIndex: 0
+            sectionMode: false, sectionElements: [], sectionElementIndex: 0,
+            wordRanges: null, boundaryFallbackTimer: null
         };
 
         function updateSectionTitles(lang) {
@@ -1045,6 +1046,30 @@
             }
         }
 
+        // ---- Mapa charIndex real -> índice de palabra (basado en textContent) ----
+        function buildWordCharMap(element) {
+            const fullText = element.textContent;
+            const wordRegex = /\S+/g;
+            const ranges = [];
+            let m, idx = 0;
+            while ((m = wordRegex.exec(fullText)) !== null) {
+                ranges.push({ wordIndex: idx, start: m.index, end: m.index + m[0].length });
+                idx++;
+            }
+            return ranges;
+        }
+
+        function wordIndexFromChar(charIndex, ranges) {
+            for (let i = 0; i < ranges.length; i++) {
+                if (charIndex >= ranges[i].start && charIndex < ranges[i].end) return ranges[i].wordIndex;
+            }
+            for (let i = 0; i < ranges.length; i++) {
+                if (charIndex < ranges[i].start) return ranges[i].wordIndex;
+            }
+            return ranges.length - 1;
+        }
+
+        // ---- Fallback por temporizador (navegadores sin onboundary) ----
         function startTimedHighlighting(element, lang, totalWords, onComplete) {
             stopTimedHighlighting();
             playbackState.currentElement = element;
@@ -1053,20 +1078,61 @@
             highlightWord(element, 0, lang);
             playbackState.highlightInterval = setInterval(() => {
                 playbackState.currentWordIndex++;
-                if (playbackState.currentWordIndex >= totalWords) { stopTimedHighlighting(); if (onComplete) onComplete(); return; }
+                if (playbackState.currentWordIndex >= totalWords) {
+                    stopTimedHighlighting();
+                    if (onComplete) onComplete();
+                    return;
+                }
                 highlightWord(element, playbackState.currentWordIndex, lang);
             }, MS_PER_WORD);
         }
 
+        // ---- Resaltado sincronizado real usando onboundary ----
+        function startBoundaryHighlighting(element, lang, utterance) {
+            stopTimedHighlighting();
+            playbackState.currentElement = element;
+            playbackState.currentWordIndex = 0;
+            playbackState.wordRanges = buildWordCharMap(element);
+            playbackState.totalWords = playbackState.wordRanges.length;
+            highlightWord(element, 0, lang);
+
+            let boundaryFired = false;
+
+            utterance.onboundary = function (event) {
+                if (event.name && event.name !== 'word' && event.name !== 'char') return;
+                if (typeof event.charIndex !== 'number') return;
+                boundaryFired = true;
+                const wIdx = wordIndexFromChar(event.charIndex, playbackState.wordRanges);
+                if (wIdx !== playbackState.currentWordIndex) {
+                    playbackState.currentWordIndex = wIdx;
+                    highlightWord(element, wIdx, lang);
+                }
+            };
+
+            // Fallback por si el motor no dispara onboundary (ej. Firefox)
+            playbackState.boundaryFallbackTimer = setTimeout(() => {
+                if (!boundaryFired && playbackState.isPlaying && playbackState.currentElement === element) {
+                    startTimedHighlighting(element, lang, playbackState.totalWords, () => {});
+                }
+            }, 600);
+        }
+
         function stopTimedHighlighting() {
-            if (playbackState.highlightInterval) { clearInterval(playbackState.highlightInterval); playbackState.highlightInterval = null; }
+            if (playbackState.highlightInterval) {
+                clearInterval(playbackState.highlightInterval);
+                playbackState.highlightInterval = null;
+            }
+            if (playbackState.boundaryFallbackTimer) {
+                clearTimeout(playbackState.boundaryFallbackTimer);
+                playbackState.boundaryFallbackTimer = null;
+            }
         }
 
         function stopAll() {
             window.speechSynthesis.cancel();
             stopTimedHighlighting();
             clearAllHighlights();
-            playbackState = { isPlaying: false, currentParaId: null, currentLang: null, utterance: null, highlightInterval: null, currentWordIndex: 0, totalWords: 0, currentElement: null, sectionMode: false, sectionElements: [], sectionElementIndex: 0 };
+            playbackState = { isPlaying: false, currentParaId: null, currentLang: null, utterance: null, highlightInterval: null, currentWordIndex: 0, totalWords: 0, currentElement: null, sectionMode: false, sectionElements: [], sectionElementIndex: 0, wordRanges: null, boundaryFallbackTimer: null };
             updateSectionTitles('en');
             updateAllButtons();
         }
@@ -1084,7 +1150,7 @@
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.lang = lang === 'en' ? 'en-US' : 'es-ES';
             utterance.rate = SPEECH_RATE; utterance.pitch = 1; utterance.volume = 1;
-            utterance.onstart = function() { startTimedHighlighting(element, lang, wordCount, () => {}); updateAllButtons(); };
+            utterance.onstart = function() { startBoundaryHighlighting(element, lang, utterance); updateAllButtons(); };
             utterance.onend = function() { stopTimedHighlighting(); clearAllHighlights(); playbackState.isPlaying = false; playbackState.currentParaId = null; playbackState.currentLang = null; updateSectionTitles('en'); updateAllButtons(); };
             utterance.onerror = function(event) { console.error('Speech error:', event); stopAll(); };
             playbackState.utterance = utterance;
@@ -1116,7 +1182,7 @@
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.lang = playbackState.currentLang === 'en' ? 'en-US' : 'es-ES';
             utterance.rate = SPEECH_RATE; utterance.pitch = 1; utterance.volume = 1;
-            utterance.onstart = function() { startTimedHighlighting(element, playbackState.currentLang, wordCount, () => {}); };
+            utterance.onstart = function() { startBoundaryHighlighting(element, playbackState.currentLang, utterance); };
             utterance.onend = function() {
                 stopTimedHighlighting(); clearAllHighlights(); playbackState.sectionElementIndex++;
                 setTimeout(() => { if (playbackState.isPlaying && playbackState.sectionMode) playNextInSection(); }, 300);
